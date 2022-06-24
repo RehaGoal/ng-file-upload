@@ -1,8 +1,430 @@
 /**!
+ * AngularJS file upload directives and services. Supports: file upload/drop/paste, resume, cancel/abort,
+ * progress, resize, thumbnail, preview, validation and CORS
+ * FileAPI Flash shim for old browsers not supporting FormData
+ * @author  Danial  <danial.farid@gmail.com>
+ * @version 12.3.0
+ */
+
+(function () {
+  /** @namespace FileAPI.noContentTimeout */
+
+  function patchXHR(fnName, newFn) {
+    window.XMLHttpRequest.prototype[fnName] = newFn(window.XMLHttpRequest.prototype[fnName]);
+  }
+
+  function redefineProp(xhr, prop, fn) {
+    try {
+      Object.defineProperty(xhr, prop, {get: fn});
+    } catch (e) {/*ignore*/
+    }
+  }
+
+  if (!window.FileAPI) {
+    window.FileAPI = {};
+  }
+
+  if (!window.XMLHttpRequest) {
+    throw 'AJAX is not supported. XMLHttpRequest is not defined.';
+  }
+
+  FileAPI.shouldLoad = !window.FormData || FileAPI.forceLoad;
+  if (FileAPI.shouldLoad) {
+    var initializeUploadListener = function (xhr) {
+      if (!xhr.__listeners) {
+        if (!xhr.upload) xhr.upload = {};
+        xhr.__listeners = [];
+        var origAddEventListener = xhr.upload.addEventListener;
+        xhr.upload.addEventListener = function (t, fn) {
+          xhr.__listeners[t] = fn;
+          if (origAddEventListener) origAddEventListener.apply(this, arguments);
+        };
+      }
+    };
+
+    patchXHR('open', function (orig) {
+      return function (m, url, b) {
+        initializeUploadListener(this);
+        this.__url = url;
+        try {
+          orig.apply(this, [m, url, b]);
+        } catch (e) {
+          if (e.message.indexOf('Access is denied') > -1) {
+            this.__origError = e;
+            orig.apply(this, [m, '_fix_for_ie_crossdomain__', b]);
+          }
+        }
+      };
+    });
+
+    patchXHR('getResponseHeader', function (orig) {
+      return function (h) {
+        return this.__fileApiXHR && this.__fileApiXHR.getResponseHeader ? this.__fileApiXHR.getResponseHeader(h) : (orig == null ? null : orig.apply(this, [h]));
+      };
+    });
+
+    patchXHR('getAllResponseHeaders', function (orig) {
+      return function () {
+        return this.__fileApiXHR && this.__fileApiXHR.getAllResponseHeaders ? this.__fileApiXHR.getAllResponseHeaders() : (orig == null ? null : orig.apply(this));
+      };
+    });
+
+    patchXHR('abort', function (orig) {
+      return function () {
+        return this.__fileApiXHR && this.__fileApiXHR.abort ? this.__fileApiXHR.abort() : (orig == null ? null : orig.apply(this));
+      };
+    });
+
+    patchXHR('setRequestHeader', function (orig) {
+      return function (header, value) {
+        if (header === '__setXHR_') {
+          initializeUploadListener(this);
+          var val = value(this);
+          // fix for angular < 1.2.0
+          if (val instanceof Function) {
+            val(this);
+          }
+        } else {
+          this.__requestHeaders = this.__requestHeaders || {};
+          this.__requestHeaders[header] = value;
+          orig.apply(this, arguments);
+        }
+      };
+    });
+
+    patchXHR('send', function (orig) {
+      return function () {
+        var xhr = this;
+        if (arguments[0] && arguments[0].__isFileAPIShim) {
+          var formData = arguments[0];
+          var config = {
+            url: xhr.__url,
+            jsonp: false, //removes the callback form param
+            cache: true, //removes the ?fileapiXXX in the url
+            complete: function (err, fileApiXHR) {
+              if (err && angular.isString(err) && err.indexOf('#2174') !== -1) {
+                // this error seems to be fine the file is being uploaded properly.
+                err = null;
+              }
+              xhr.__completed = true;
+              if (!err && xhr.__listeners.load)
+                xhr.__listeners.load({
+                  type: 'load',
+                  loaded: xhr.__loaded,
+                  total: xhr.__total,
+                  target: xhr,
+                  lengthComputable: true
+                });
+              if (!err && xhr.__listeners.loadend)
+                xhr.__listeners.loadend({
+                  type: 'loadend',
+                  loaded: xhr.__loaded,
+                  total: xhr.__total,
+                  target: xhr,
+                  lengthComputable: true
+                });
+              if (err === 'abort' && xhr.__listeners.abort)
+                xhr.__listeners.abort({
+                  type: 'abort',
+                  loaded: xhr.__loaded,
+                  total: xhr.__total,
+                  target: xhr,
+                  lengthComputable: true
+                });
+              if (fileApiXHR.status !== undefined) redefineProp(xhr, 'status', function () {
+                return (fileApiXHR.status === 0 && err && err !== 'abort') ? 500 : fileApiXHR.status;
+              });
+              if (fileApiXHR.statusText !== undefined) redefineProp(xhr, 'statusText', function () {
+                return fileApiXHR.statusText;
+              });
+              redefineProp(xhr, 'readyState', function () {
+                return 4;
+              });
+              if (fileApiXHR.response !== undefined) redefineProp(xhr, 'response', function () {
+                return fileApiXHR.response;
+              });
+              var resp = fileApiXHR.responseText || (err && fileApiXHR.status === 0 && err !== 'abort' ? err : undefined);
+              redefineProp(xhr, 'responseText', function () {
+                return resp;
+              });
+              redefineProp(xhr, 'response', function () {
+                return resp;
+              });
+              if (err) redefineProp(xhr, 'err', function () {
+                return err;
+              });
+              xhr.__fileApiXHR = fileApiXHR;
+              if (xhr.onreadystatechange) xhr.onreadystatechange();
+              if (xhr.onload) xhr.onload();
+            },
+            progress: function (e) {
+              e.target = xhr;
+              if (xhr.__listeners.progress) xhr.__listeners.progress(e);
+              xhr.__total = e.total;
+              xhr.__loaded = e.loaded;
+              if (e.total === e.loaded) {
+                // fix flash issue that doesn't call complete if there is no response text from the server
+                var _this = this;
+                setTimeout(function () {
+                  if (!xhr.__completed) {
+                    xhr.getAllResponseHeaders = function () {
+                    };
+                    _this.complete(null, {status: 204, statusText: 'No Content'});
+                  }
+                }, FileAPI.noContentTimeout || 10000);
+              }
+            },
+            headers: xhr.__requestHeaders
+          };
+          config.data = {};
+          config.files = {};
+          for (var i = 0; i < formData.data.length; i++) {
+            var item = formData.data[i];
+            if (item.val != null && item.val.name != null && item.val.size != null && item.val.type != null) {
+              config.files[item.key] = item.val;
+            } else {
+              config.data[item.key] = item.val;
+            }
+          }
+
+          setTimeout(function () {
+            if (!FileAPI.hasFlash) {
+              throw 'Adode Flash Player need to be installed. To check ahead use "FileAPI.hasFlash"';
+            }
+            xhr.__fileApiXHR = FileAPI.upload(config);
+          }, 1);
+        } else {
+          if (this.__origError) {
+            throw this.__origError;
+          }
+          orig.apply(xhr, arguments);
+        }
+      };
+    });
+    window.XMLHttpRequest.__isFileAPIShim = true;
+    window.FormData = FormData = function () {
+      return {
+        append: function (key, val, name) {
+          if (val.__isFileAPIBlobShim) {
+            val = val.data[0];
+          }
+          this.data.push({
+            key: key,
+            val: val,
+            name: name
+          });
+        },
+        data: [],
+        __isFileAPIShim: true
+      };
+    };
+
+    window.Blob = Blob = function (b) {
+      return {
+        data: b,
+        __isFileAPIBlobShim: true
+      };
+    };
+  }
+
+})();
+
+(function () {
+  /** @namespace FileAPI.forceLoad */
+  /** @namespace window.FileAPI.jsUrl */
+  /** @namespace window.FileAPI.jsPath */
+
+  function isInputTypeFile(elem) {
+    return elem[0].tagName.toLowerCase() === 'input' && elem.attr('type') && elem.attr('type').toLowerCase() === 'file';
+  }
+
+  function hasFlash() {
+    try {
+      var fo = new ActiveXObject('ShockwaveFlash.ShockwaveFlash');
+      if (fo) return true;
+    } catch (e) {
+      if (navigator.mimeTypes['application/x-shockwave-flash'] !== undefined) return true;
+    }
+    return false;
+  }
+
+  function getOffset(obj) {
+    var left = 0, top = 0;
+
+    if (window.jQuery) {
+      return jQuery(obj).offset();
+    }
+
+    if (obj.offsetParent) {
+      do {
+        left += (obj.offsetLeft - obj.scrollLeft);
+        top += (obj.offsetTop - obj.scrollTop);
+        obj = obj.offsetParent;
+      } while (obj);
+    }
+    return {
+      left: left,
+      top: top
+    };
+  }
+
+  if (FileAPI.shouldLoad) {
+    FileAPI.hasFlash = hasFlash();
+
+    //load FileAPI
+    if (FileAPI.forceLoad) {
+      FileAPI.html5 = false;
+    }
+
+    if (!FileAPI.upload) {
+      var jsUrl, basePath, script = document.createElement('script'), allScripts = document.getElementsByTagName('script'), i, index, src;
+      if (window.FileAPI.jsUrl) {
+        jsUrl = window.FileAPI.jsUrl;
+      } else if (window.FileAPI.jsPath) {
+        basePath = window.FileAPI.jsPath;
+      } else {
+        for (i = 0; i < allScripts.length; i++) {
+          src = allScripts[i].src;
+          index = src.search(/\/ng\-file\-upload[\-a-zA-z0-9\.]*\.js/);
+          if (index > -1) {
+            basePath = src.substring(0, index + 1);
+            break;
+          }
+        }
+      }
+
+      if (FileAPI.staticPath == null) FileAPI.staticPath = basePath;
+      script.setAttribute('src', jsUrl || basePath + 'FileAPI.min.js');
+      document.getElementsByTagName('head')[0].appendChild(script);
+    }
+
+    FileAPI.ngfFixIE = function (elem, fileElem, changeFn) {
+      if (!hasFlash()) {
+        throw 'Adode Flash Player need to be installed. To check ahead use "FileAPI.hasFlash"';
+      }
+      var fixInputStyle = function () {
+        var label = fileElem.parent();
+        if (elem.attr('disabled')) {
+          if (label) label.removeClass('js-fileapi-wrapper');
+        } else {
+          if (!fileElem.attr('__ngf_flash_')) {
+            fileElem.unbind('change');
+            fileElem.unbind('click');
+            fileElem.bind('change', function (evt) {
+              fileApiChangeFn.apply(this, [evt]);
+              changeFn.apply(this, [evt]);
+            });
+            fileElem.attr('__ngf_flash_', 'true');
+          }
+          label.addClass('js-fileapi-wrapper');
+          if (!isInputTypeFile(elem)) {
+            label.css('position', 'absolute')
+              .css('top', getOffset(elem[0]).top + 'px').css('left', getOffset(elem[0]).left + 'px')
+              .css('width', elem[0].offsetWidth + 'px').css('height', elem[0].offsetHeight + 'px')
+              .css('filter', 'alpha(opacity=0)').css('display', elem.css('display'))
+              .css('overflow', 'hidden').css('z-index', '900000')
+              .css('visibility', 'visible');
+            fileElem.css('width', elem[0].offsetWidth + 'px').css('height', elem[0].offsetHeight + 'px')
+              .css('position', 'absolute').css('top', '0px').css('left', '0px');
+          }
+        }
+      };
+
+      elem.bind('mouseenter', fixInputStyle);
+
+      var fileApiChangeFn = function (evt) {
+        var files = FileAPI.getFiles(evt);
+        //just a double check for #233
+        for (var i = 0; i < files.length; i++) {
+          if (files[i].size === undefined) files[i].size = 0;
+          if (files[i].name === undefined) files[i].name = 'file';
+          if (files[i].type === undefined) files[i].type = 'undefined';
+        }
+        if (!evt.target) {
+          evt.target = {};
+        }
+        evt.target.files = files;
+        // if evt.target.files is not writable use helper field
+        if (evt.target.files !== files) {
+          evt.__files_ = files;
+        }
+        (evt.__files_ || evt.target.files).item = function (i) {
+          return (evt.__files_ || evt.target.files)[i] || null;
+        };
+      };
+    };
+
+    FileAPI.disableFileInput = function (elem, disable) {
+      if (disable) {
+        elem.removeClass('js-fileapi-wrapper');
+      } else {
+        elem.addClass('js-fileapi-wrapper');
+      }
+    };
+  }
+})();
+
+if (!window.FileReader) {
+  window.FileReader = function () {
+    var _this = this, loadStarted = false;
+    this.listeners = {};
+    this.addEventListener = function (type, fn) {
+      _this.listeners[type] = _this.listeners[type] || [];
+      _this.listeners[type].push(fn);
+    };
+    this.removeEventListener = function (type, fn) {
+      if (_this.listeners[type]) _this.listeners[type].splice(_this.listeners[type].indexOf(fn), 1);
+    };
+    this.dispatchEvent = function (evt) {
+      var list = _this.listeners[evt.type];
+      if (list) {
+        for (var i = 0; i < list.length; i++) {
+          list[i].call(_this, evt);
+        }
+      }
+    };
+    this.onabort = this.onerror = this.onload = this.onloadstart = this.onloadend = this.onprogress = null;
+
+    var constructEvent = function (type, evt) {
+      var e = {type: type, target: _this, loaded: evt.loaded, total: evt.total, error: evt.error};
+      if (evt.result != null) e.target.result = evt.result;
+      return e;
+    };
+    var listener = function (evt) {
+      if (!loadStarted) {
+        loadStarted = true;
+        if (_this.onloadstart) _this.onloadstart(constructEvent('loadstart', evt));
+      }
+      var e;
+      if (evt.type === 'load') {
+        if (_this.onloadend) _this.onloadend(constructEvent('loadend', evt));
+        e = constructEvent('load', evt);
+        if (_this.onload) _this.onload(e);
+        _this.dispatchEvent(e);
+      } else if (evt.type === 'progress') {
+        e = constructEvent('progress', evt);
+        if (_this.onprogress) _this.onprogress(e);
+        _this.dispatchEvent(e);
+      } else {
+        e = constructEvent('error', evt);
+        if (_this.onerror) _this.onerror(e);
+        _this.dispatchEvent(e);
+      }
+    };
+    this.readAsDataURL = function (file) {
+      FileAPI.readAsDataURL(file, listener);
+    };
+    this.readAsText = function (file) {
+      FileAPI.readAsText(file, listener);
+    };
+  };
+}
+
+/**!
  * AngularJS file upload directives and services. Supoorts: file upload/drop/paste, resume, cancel/abort,
  * progress, resize, thumbnail, preview, validation and CORS
  * @author  Danial  <danial.farid@gmail.com>
- * @version 12.2.13
+ * @version 12.3.0
  */
 
 if (window.XMLHttpRequest && !(window.FileAPI && FileAPI.shouldLoad)) {
@@ -23,7 +445,7 @@ if (window.XMLHttpRequest && !(window.FileAPI && FileAPI.shouldLoad)) {
 
 var ngFileUpload = angular.module('ngFileUpload', []);
 
-ngFileUpload.version = '12.2.13';
+ngFileUpload.version = '12.3.0';
 
 ngFileUpload.service('UploadBase', ['$http', '$q', '$timeout', function ($http, $q, $timeout) {
   var upload = this;
@@ -619,8 +1041,8 @@ ngFileUpload.service('Upload', ['$parse', '$timeout', '$compile', '$q', 'UploadE
         if (validateAfterResize) {
           upload.validate(allNewFiles, keep ? prevValidFiles.length : 0, ngModel, attr, scope)
             .then(function (validationResult) {
-              valids = validationResult.validsFiles;
-              invalids = validationResult.invalidsFiles;
+              valids = validationResult.validFiles;
+              invalids = validationResult.invalidFiles;
               updateModel();
             });
         } else {
@@ -1674,14 +2096,15 @@ ngFileUpload.service('UploadValidate', ['UploadDataUrl', '$q', '$timeout', funct
 
         el.on('loadedmetadata', success);
         el.on('error', error);
+        
         var count = 0;
-
         function checkLoadError() {
+          count++;
           $timeout(function () {
             if (el[0].parentNode) {
               if (el[0].duration) {
                 success();
-              } else if (count > 10) {
+              } else if (count++ > 10) {
                 error();
               } else {
                 checkLoadError();
@@ -1732,12 +2155,26 @@ ngFileUpload.service('UploadResize', ['UploadValidate', '$q', function (UploadVa
   };
 
   // Extracted from https://github.com/romelgomez/angular-firebase-image-upload/blob/master/app/scripts/fileUpload.js#L89
-  var resize = function (imagen, width, height, quality, type, ratio, centerCrop, resizeIf) {
+  /**
+   *
+   * @param {File} imageFile
+   * @param width
+   * @param height
+   * @param quality
+   * @param type
+   * @param ratio
+   * @param centerCrop
+   * @param resizeIf
+   * @return {*}
+   */
+  var resize = function (imageFile, width, height, quality, type, ratio, centerCrop, resizeIf) {
     var deferred = $q.defer();
     var canvasElement = document.createElement('canvas');
     var imageElement = document.createElement('img');
     imageElement.setAttribute('style', 'visibility:hidden;position:fixed;z-index:-100000');
     document.body.appendChild(imageElement);
+
+    var objectURL = URL.createObjectURL(imageFile);
 
     imageElement.onload = function () {
       var imgWidth = imageElement.width, imgHeight = imageElement.height;
@@ -1769,18 +2206,27 @@ ngFileUpload.service('UploadResize', ['UploadValidate', '$q', function (UploadVa
         canvasElement.height = Math.min(dimensions.height, height);
         var context = canvasElement.getContext('2d');
         context.drawImage(imageElement,
-          Math.min(0, -dimensions.marginX / 2), Math.min(0, -dimensions.marginY / 2),
-          dimensions.width, dimensions.height);
-        deferred.resolve(canvasElement.toDataURL(type || 'image/WebP', quality || 0.934));
+            Math.min(0, -dimensions.marginX / 2), Math.min(0, -dimensions.marginY / 2),
+            dimensions.width, dimensions.height);
+        canvasElement.toBlob(function(blob) {
+          if (!blob) {
+            deferred.reject('toBlob');
+          } else {
+            deferred.resolve(blob);
+          }
+        }, type || 'image/WebP', quality || 0.934);
       } catch (e) {
         deferred.reject(e);
+      } finally {
+        URL.revokeObjectURL(objectURL);
       }
     };
     imageElement.onerror = function () {
       imageElement.parentNode.removeChild(imageElement);
+      URL.revokeObjectURL(objectURL);
       deferred.reject();
     };
-    imageElement.src = imagen;
+    imageElement.src = objectURL;
     return deferred.promise;
   };
 
@@ -1791,6 +2237,17 @@ ngFileUpload.service('UploadResize', ['UploadValidate', '$q', function (UploadVa
       u8arr[n] = bstr.charCodeAt(n);
     }
     var blob = new window.Blob([u8arr], {type: mime});
+    return upload.blobToFileLike(blob, name, origSize);
+  };
+
+  /**
+   *
+   * @param {Blob} blob
+   * @param {string} name
+   * @param {number} origSize
+   * @return {Blob & {name: string, $ngfOrigSize: number}}
+   */
+  upload.blobToFileLike = function (blob, name, origSize) {
     blob.name = name;
     blob.$ngfOrigSize = origSize;
     return blob;
@@ -1814,36 +2271,29 @@ ngFileUpload.service('UploadResize', ['UploadValidate', '$q', function (UploadVa
     });
   }
 
-  upload.resize = function (file, options) {
-    if (file.type.indexOf('image') !== 0) return upload.emptyPromise(file);
+  upload.resize = function (origFile, options) {
+    if (origFile.type.indexOf('image') !== 0) return upload.emptyPromise(origFile);
 
     var deferred = $q.defer();
-    upload.dataUrl(file, true).then(function (url) {
-      resize(url, options.width, options.height, options.quality, options.type || file.type,
+    resize(origFile, options.width, options.height, options.quality, options.type || origFile.type,
         options.ratio, options.centerCrop, options.resizeIf)
-        .then(function (dataUrl) {
-          if (file.type === 'image/jpeg' && options.restoreExif !== false) {
-            try {
-              dataUrl = upload.restoreExif(url, dataUrl);
-            } catch (e) {
-              setTimeout(function () {throw e;}, 1);
-            }
+        .then(function (/** Blob */ initialResizedBlob) {
+          var resizedBlobPromise = $q.resolve(initialResizedBlob);
+          if (initialResizedBlob.type === 'image/jpeg' && options.restoreExif !== false) {
+            resizedBlobPromise = upload.restoreExif(origFile, initialResizedBlob);
           }
-          try {
-            var blob = upload.dataUrltoBlob(dataUrl, file.name, file.size);
-            deferred.resolve(blob);
-          } catch (e) {
+          resizedBlobPromise.then(function(resizedBlob) {
+            var resizedBlobWithInfo = upload.blobToFileLike(resizedBlob, origFile.name, origFile.size);
+            deferred.resolve(resizedBlobWithInfo);
+          }).catch(function(e) {
             deferred.reject(e);
-          }
+          });
         }, function (r) {
           if (r === 'resizeIf') {
-            deferred.resolve(file);
+            deferred.resolve(origFile);
           }
           deferred.reject(r);
         });
-    }, function (e) {
-      deferred.reject(e);
-    });
     return deferred.promise;
   };
 
@@ -2256,16 +2706,30 @@ ngFileUpload.service('UploadExif', ['UploadResize', '$q', function (UploadResize
     return defer.promise;
   };
 
-  function arrayBufferToBase64(buffer) {
-    var binary = '';
-    var bytes = new Uint8Array(buffer);
-    var len = bytes.byteLength;
-    for (var i = 0; i < len; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return window.btoa(binary);
-  }
+  /**
+   * Call canvas.toBlob and return as Promise
+   * @param {HTMLCanvasElement} canvas
+   * @param {string} type
+   * @param {number} quality
+   * @return Promise<Blob>
+   */
+  upload.canvasToBlob = function(canvas, type, quality) {
+    return new Promise(function(resolve, reject) {
+      canvas.toBlob(function(canvasBlob) {
+        if (!canvasBlob) {
+          reject('toBlob');
+        } else {
+          resolve(canvasBlob);
+        }
+      }, type, quality);
+    });
+  };
 
+  /**
+   * Apply the rotation from the EXIF information to the image and return a new Blob.
+   * @param {File} file
+   * @return {Promise<Blob>}
+   */
   upload.applyExifRotation = function (file) {
     if (file.type.indexOf('image/jpeg') !== 0) {
       return upload.emptyPromise(file);
@@ -2276,99 +2740,78 @@ ngFileUpload.service('UploadExif', ['UploadResize', '$q', function (UploadResize
       if (result.orientation < 2 || result.orientation > 8) {
         return deferred.resolve(file);
       }
-      upload.dataUrl(file, true).then(function (url) {
-        var canvas = document.createElement('canvas');
-        var img = document.createElement('img');
+      var canvas = document.createElement('canvas');
+      var img = document.createElement('img');
 
-        img.onload = function () {
-          try {
-            canvas.width = result.orientation > 4 ? img.height : img.width;
-            canvas.height = result.orientation > 4 ? img.width : img.height;
-            var ctx = canvas.getContext('2d');
-            applyTransform(ctx, result.orientation, img.width, img.height);
-            ctx.drawImage(img, 0, 0);
-            var dataUrl = canvas.toDataURL(file.type || 'image/WebP', 0.934);
-            dataUrl = upload.restoreExif(arrayBufferToBase64(result.fixedArrayBuffer), dataUrl);
-            var blob = upload.dataUrltoBlob(dataUrl, file.name);
-            deferred.resolve(blob);
-          } catch (e) {
-            return deferred.reject(e);
-          }
-        };
-        img.onerror = function () {
-          deferred.reject();
-        };
-        img.src = url;
-      }, function (e) {
-        deferred.reject(e);
-      });
+      var objectURL = URL.createObjectURL(file);
+
+      img.onload = function () {
+        try {
+          canvas.width = result.orientation > 4 ? img.height : img.width;
+          canvas.height = result.orientation > 4 ? img.width : img.height;
+          var ctx = canvas.getContext('2d');
+          applyTransform(ctx, result.orientation, img.width, img.height);
+          ctx.drawImage(img, 0, 0);
+          upload.canvasToBlob(canvas, file.type || 'image/WebP', 0.934).then(function(canvasBlob) {
+            return upload.restoreExif(file, canvasBlob);
+          }).then(function(blobWithExif) {
+            var blobWithExifAndInfo = upload.blobToFileLike(blobWithExif, file.name, file.size);
+            deferred.resolve(blobWithExifAndInfo);
+          }).catch(function(e) {
+            deferred.reject(e);
+          });
+        } catch (e) {
+          return deferred.reject(e);
+        } finally {
+          URL.revokeObjectURL(objectURL);
+        }
+      };
+      img.onerror = function () {
+        deferred.reject();
+        URL.revokeObjectURL(objectURL);
+      };
+      img.src = objectURL;
     }, function (e) {
       deferred.reject(e);
     });
     return deferred.promise;
   };
 
+  /**
+   *
+   * @param {File} orig
+   * @param {Blob} resized
+   * @return {Promise<Blob>}
+   */
   upload.restoreExif = function (orig, resized) {
     var ExifRestorer = {};
 
-    ExifRestorer.KEY_STR = 'ABCDEFGHIJKLMNOP' +
-      'QRSTUVWXYZabcdef' +
-      'ghijklmnopqrstuv' +
-      'wxyz0123456789+/' +
-      '=';
+    /**
+     *
+     * @param {File} origFile
+     * @param {Blob} resizedBlob
+     * @return {Promise<Blob>}
+     */
+    ExifRestorer.restore = function (origFile, resizedBlob) {
+      return Promise.all([origFile.arrayBuffer(), resizedBlob.arrayBuffer()]).then(function(rawImages) {
+        var origRawImage = rawImages[0], resizedRawImage = rawImages[1];
+        var segments = ExifRestorer.slice2Segments(new Uint8Array(origRawImage));
+        var imageWithExifData = ExifRestorer.exifManipulation(new Uint8Array(resizedRawImage), segments);
 
-    ExifRestorer.encode64 = function (input) {
-      var output = '',
-        chr1, chr2, chr3 = '',
-        enc1, enc2, enc3, enc4 = '',
-        i = 0;
-
-      do {
-        chr1 = input[i++];
-        chr2 = input[i++];
-        chr3 = input[i++];
-
-        enc1 = chr1 >> 2;
-        enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
-        enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
-        enc4 = chr3 & 63;
-
-        if (isNaN(chr2)) {
-          enc3 = enc4 = 64;
-        } else if (isNaN(chr3)) {
-          enc4 = 64;
-        }
-
-        output = output +
-          this.KEY_STR.charAt(enc1) +
-          this.KEY_STR.charAt(enc2) +
-          this.KEY_STR.charAt(enc3) +
-          this.KEY_STR.charAt(enc4);
-        chr1 = chr2 = chr3 = '';
-        enc1 = enc2 = enc3 = enc4 = '';
-      } while (i < input.length);
-
-      return output;
-    };
-
-    ExifRestorer.restore = function (origFileBase64, resizedFileBase64) {
-      if (origFileBase64.match('data:image/jpeg;base64,')) {
-        origFileBase64 = origFileBase64.replace('data:image/jpeg;base64,', '');
-      }
-
-      var rawImage = this.decode64(origFileBase64);
-      var segments = this.slice2Segments(rawImage);
-
-      var image = this.exifManipulation(resizedFileBase64, segments);
-
-      return 'data:image/jpeg;base64,' + this.encode64(image);
+        return new Blob([imageWithExifData], {type: resizedBlob.type});
+      });
     };
 
 
-    ExifRestorer.exifManipulation = function (resizedFileBase64, segments) {
-      var exifArray = this.getExifArray(segments),
-        newImageArray = this.insertExif(resizedFileBase64, exifArray);
-      return new Uint8Array(newImageArray);
+    /**
+     *
+     * @param {Uint8Array} resizedImageArray
+     * @param segments
+     * @return {Uint8Array}
+     */
+    ExifRestorer.exifManipulation = function (resizedImageArray, segments) {
+      var exifArray = this.getExifArray(segments);
+      return this.insertExif(resizedImageArray, exifArray);
     };
 
 
@@ -2385,23 +2828,31 @@ ngFileUpload.service('UploadExif', ['UploadResize', '$q', function (UploadResize
     };
 
 
-    ExifRestorer.insertExif = function (resizedFileBase64, exifArray) {
-      var imageData = resizedFileBase64.replace('data:image/jpeg;base64,', ''),
-        buf = this.decode64(imageData),
-        separatePoint = buf.indexOf(255, 3),
-        mae = buf.slice(0, separatePoint),
-        ato = buf.slice(separatePoint),
-        array = mae;
+    /**
+     *
+     * @param {Uint8Array} resizedFileArray
+     * @param exifArray
+     * @return {Uint8Array}
+     */
+    ExifRestorer.insertExif = function (/** Uint8Array */resizedFileArray, exifArray) {
+      var separatePoint = resizedFileArray.indexOf(255, 3),
+          mae = resizedFileArray.slice(0, separatePoint),
+          ato = resizedFileArray.slice(separatePoint);
 
-      array = array.concat(exifArray);
-      array = array.concat(ato);
-      return array;
+      var newImageData = new Uint8Array(mae.length + exifArray.length + ato.length);
+      var length = 0;
+      var toConcat = [mae, exifArray, ato];
+      for (var i = 0; i < toConcat.length; ++i) {
+        newImageData.set(toConcat[i], length);
+        length += toConcat[i].length;
+      }
+      return newImageData;
     };
 
 
     ExifRestorer.slice2Segments = function (rawImageArray) {
       var head = 0,
-        segments = [];
+          segments = [];
 
       while (1) {
         if (rawImageArray[head] === 255 & rawImageArray[head + 1] === 218) {
@@ -2412,8 +2863,8 @@ ngFileUpload.service('UploadExif', ['UploadResize', '$q', function (UploadResize
         }
         else {
           var length = rawImageArray[head + 2] * 256 + rawImageArray[head + 3],
-            endPoint = head + length + 2,
-            seg = rawImageArray.slice(head, endPoint);
+              endPoint = head + length + 2,
+              seg = rawImageArray.slice(head, endPoint);
           segments.push(seg);
           head = endPoint;
         }
@@ -2423,49 +2874,6 @@ ngFileUpload.service('UploadExif', ['UploadResize', '$q', function (UploadResize
       }
 
       return segments;
-    };
-
-
-    ExifRestorer.decode64 = function (input) {
-      var chr1, chr2, chr3 = '',
-        enc1, enc2, enc3, enc4 = '',
-        i = 0,
-        buf = [];
-
-      // remove all characters that are not A-Z, a-z, 0-9, +, /, or =
-      var base64test = /[^A-Za-z0-9\+\/\=]/g;
-      if (base64test.exec(input)) {
-        console.log('There were invalid base64 characters in the input text.\n' +
-          'Valid base64 characters are A-Z, a-z, 0-9, ' + ', ' / ',and "="\n' +
-          'Expect errors in decoding.');
-      }
-      input = input.replace(/[^A-Za-z0-9\+\/\=]/g, '');
-
-      do {
-        enc1 = this.KEY_STR.indexOf(input.charAt(i++));
-        enc2 = this.KEY_STR.indexOf(input.charAt(i++));
-        enc3 = this.KEY_STR.indexOf(input.charAt(i++));
-        enc4 = this.KEY_STR.indexOf(input.charAt(i++));
-
-        chr1 = (enc1 << 2) | (enc2 >> 4);
-        chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
-        chr3 = ((enc3 & 3) << 6) | enc4;
-
-        buf.push(chr1);
-
-        if (enc3 !== 64) {
-          buf.push(chr2);
-        }
-        if (enc4 !== 64) {
-          buf.push(chr3);
-        }
-
-        chr1 = chr2 = chr3 = '';
-        enc1 = enc2 = enc3 = enc4 = '';
-
-      } while (i < input.length);
-
-      return buf;
     };
 
     return ExifRestorer.restore(orig, resized);  //<= EXIF
